@@ -16,5 +16,7 @@ export const getVideoUrl = (path) => {
     if (path.startsWith('http')) return path;
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     if (API_BASE_URL) return `${API_BASE_URL}${normalizedPath}`;
+    // In production (same origin), use relative paths; in dev, use backend directly
+    if (import.meta.env.PROD) return normalizedPath;
     return `${BACKEND_URL}${normalizedPath}`;
 };

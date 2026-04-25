@@ -182,6 +182,11 @@ THUMBNAILS_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
 os.makedirs(THUMBNAILS_DIR, exist_ok=True)
 app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails")
 
+# Serve built frontend (SPA) from /app/static if it exists (production Docker build)
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(STATIC_DIR):
+    app.mount("/assets", StaticFiles(directory=os.path.join(STATIC_DIR, "assets")), name="frontend-assets")
+
 
 @app.api_route("/videos/{path:path}", methods=["GET", "HEAD"])
 async def serve_video(path: str, request: Request):
@@ -2301,3 +2306,31 @@ async def saasshorts_voices(
         ],
         "source": "defaults",
     }
+
+
+# ── SPA catch-all: serve index.html for any non-API route ──
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(_STATIC_DIR):
+    _index_html = os.path.join(_STATIC_DIR, "index.html")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """Serve frontend SPA — static files or index.html fallback."""
+        file_path = os.path.join(_STATIC_DIR, full_path)
+        if full_path and os.path.isfile(file_path):
+            media_types = {
+                ".js": "application/javascript",
+                ".css": "text/css",
+                ".svg": "image/svg+xml",
+                ".png": "image/png",
+                ".ico": "image/x-icon",
+                ".json": "application/json",
+                ".woff2": "font/woff2",
+                ".woff": "font/woff",
+            }
+            ext = os.path.splitext(full_path)[1].lower()
+            return Response(
+                content=open(file_path, "rb").read(),
+                media_type=media_types.get(ext, "application/octet-stream"),
+            )
+        return HTMLResponse(content=open(_index_html).read())
