@@ -1,3 +1,6 @@
+import os
+os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
+
 import time
 import cv2
 import scenedetect
@@ -9,13 +12,12 @@ from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
 from ultralytics import YOLO
 import torch
-import os
 import numpy as np
 from tqdm import tqdm
 import yt_dlp
 import mediapipe as mp
 # import whisper (replaced by faster_whisper inside function)
-from google import genai
+from openai import OpenAI
 from dotenv import load_dotenv
 import json
 
@@ -28,14 +30,18 @@ load_dotenv()
 # --- Constants ---
 ASPECT_RATIO = 9 / 16
 
-GEMINI_PROMPT_TEMPLATE = """
-You are a senior short-form video editor. Read the ENTIRE transcript and word-level timestamps to choose the 3–15 MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts. Each clip must be between 15 and 60 seconds long.
+DEFAULT_NUM_CLIPS = 5
+DEFAULT_MIN_DURATION = 15
+DEFAULT_MAX_DURATION = 60
+
+CLIP_PROMPT_TEMPLATE = """
+You are a senior short-form video editor. Read the ENTIRE transcript and word-level timestamps to choose exactly {num_clips} MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts. Each clip must be between {min_duration} and {max_duration} seconds long.
 
 ⚠️ FFMPEG TIME CONTRACT — STRICT REQUIREMENTS:
 - Return timestamps in ABSOLUTE SECONDS from the start of the video (usable in: ffmpeg -ss <start> -to <end> -i <input> ...).
 - Only NUMBERS with decimal point, up to 3 decimals (examples: 0, 1.250, 17.350).
 - Ensure 0 ≤ start < end ≤ VIDEO_DURATION_SECONDS.
-- Each clip between 15 and 60 s (inclusive).
+- Each clip between {min_duration} and {max_duration} s (inclusive).
 - Prefer starting 0.2–0.4 s BEFORE the hook and ending 0.2–0.4 s AFTER the payoff.
 - Use silence moments for natural cuts; never cut in the middle of a word or phrase.
 - STRICTLY FORBIDDEN to use time formats other than absolute seconds.
@@ -50,9 +56,9 @@ WORDS_JSON (array of {{w, s, e}} where s/e are seconds):
 
 STRICT EXCLUSIONS:
 - No generic intros/outros or purely sponsorship segments unless they contain the hook.
-- No clips < 15 s or > 60 s.
+- No clips shorter than {min_duration}s or longer than {max_duration}s.
 
-OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by predicted performance (best to worst). In the descriptions, ALWAYS include a CTA like "Follow me and comment X and I'll send you the workflow" (especially if discussing an n8n workflow):
+OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Return exactly {num_clips} clips ordered by predicted viral performance (best to worst). In the descriptions, ALWAYS include an engaging CTA:
 {{
   "shorts": [
     {{
@@ -481,9 +487,9 @@ def download_youtube_video(url, output_dir="."):
     # extractor_args tries multiple player clients in order; tv_embed / android
     # avoid the OAuth/PO-token checks that block server IPs.
     _COMMON_YDL_OPTS = {
-        'quiet': False,
-        'verbose': True,
-        'no_warnings': False,
+        'quiet': True,
+        'verbose': False,
+        'no_warnings': True,
         'cookiefile': cookies_path if cookies_path else None,
         'socket_timeout': 30,
         'retries': 10,
@@ -554,16 +560,33 @@ Technical Details: {str(e)}
         os.remove(expected_file)
         print(f"🗑️  Removed existing file to re-download with H.264 codec")
     
-    ydl_opts = {
-        **_COMMON_YDL_OPTS,
-        'format': 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]/best',
-        'outtmpl': output_template,
-        'merge_output_format': 'mp4',
-        'overwrites': True,
-    }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    format_chain = [
+        'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]/best',
+        'bestvideo+bestaudio/best',
+        'best',
+        '18',
+    ]
+
+    downloaded = False
+    for fmt in format_chain:
+        ydl_opts = {
+            **_COMMON_YDL_OPTS,
+            'format': fmt,
+            'outtmpl': output_template,
+            'merge_output_format': 'mp4',
+            'overwrites': True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            downloaded = True
+            break
+        except yt_dlp.utils.DownloadError:
+            print(f"⚠️  Format '{fmt}' unavailable, trying next fallback...")
+            continue
+
+    if not downloaded:
+        raise Exception("All format options exhausted — could not download video")
     
     downloaded_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
     
@@ -631,7 +654,9 @@ def process_video_to_vertical(input_video, final_output_video):
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
         '-r', str(fps), '-i', '-', '-c:v', 'libx264',
-        '-preset', 'fast', '-crf', '23', '-an', temp_video_output
+        '-pix_fmt', 'yuv420p',
+        '-profile:v', 'high', '-level', '4.0',
+        '-preset', 'medium', '-crf', '18', '-an', temp_video_output
     ]
 
     ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -728,12 +753,16 @@ def process_video_to_vertical(input_video, final_output_video):
     if os.path.exists(temp_audio_output):
         merge_command = [
             'ffmpeg', '-y', '-i', temp_video_output, '-i', temp_audio_output,
-            '-c:v', 'copy', '-c:a', 'copy', final_output_video
+            '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+            '-movflags', '+faststart',
+            final_output_video
         ]
     else:
          merge_command = [
             'ffmpeg', '-y', '-i', temp_video_output,
-            '-c:v', 'copy', final_output_video
+            '-c:v', 'copy',
+            '-movflags', '+faststart',
+            final_output_video
         ]
         
     try:
@@ -751,66 +780,153 @@ def process_video_to_vertical(input_video, final_output_video):
     return True
 
 def transcribe_video(video_path):
-    print("🎙️  Transcribing video with Faster-Whisper (CPU Optimized)...")
-    from faster_whisper import WhisperModel
-    
-    # Run on CPU with INT8 quantization for speed
-    model = WhisperModel("base", device="cpu", compute_type="int8")
-    
-    segments, info = model.transcribe(video_path, word_timestamps=True)
-    
-    print(f"   Detected language '{info.language}' with probability {info.language_probability:.2f}")
-    
-    # Convert to openai-whisper compatible format
+    deepgram_key = os.getenv("DEEPGRAM_API_KEY")
+    if deepgram_key:
+        return _transcribe_deepgram(video_path, deepgram_key)
+    return _transcribe_whisper(video_path)
+
+
+def _transcribe_deepgram(video_path, api_key):
+    """Transcribe using Deepgram Nova-3 with multilingual support."""
+    import httpx
+
+    print("🎙️  Transcribing video with Deepgram Nova-3...")
+    step_start = time.time()
+
+    with open(video_path, "rb") as f:
+        audio_data = f.read()
+
+    resp = httpx.post(
+        "https://api.deepgram.com/v1/listen",
+        params={
+            "model": "nova-3",
+            "language": "multi",
+            "smart_format": "true",
+            "punctuate": "true",
+            "utterances": "true",
+            "words": "true",
+            "detect_language": "true",
+        },
+        headers={
+            "Authorization": f"Token {api_key}",
+            "Content-Type": "audio/mp4",
+        },
+        content=audio_data,
+        timeout=300.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    results = data.get("results", {})
+    channels = results.get("channels", [])
+    detected_lang = results.get("detected_language") or (
+        channels[0].get("detected_language") if channels else "en"
+    ) or "en"
+
     transcript_segments = []
     full_text = ""
-    
-    for segment in segments:
-        # Print progress to keep user informed (and prevent timeouts feeling)
-        print(f"   [{segment.start:.2f}s -> {segment.end:.2f}s] {segment.text}")
-        
-        seg_dict = {
-            'text': segment.text,
-            'start': segment.start,
-            'end': segment.end,
-            'words': []
-        }
-        
-        if segment.words:
-            for word in segment.words:
-                seg_dict['words'].append({
-                    'word': word.word,
-                    'start': word.start,
-                    'end': word.end,
-                    'probability': word.probability
+
+    for channel in channels:
+        for alt in channel.get("alternatives", []):
+            full_text += alt.get("transcript", "") + " "
+            words = alt.get("words", [])
+            if not words:
+                continue
+            seg_words = []
+            seg_start = words[0]["start"]
+            seg_text = ""
+            for w in words:
+                seg_words.append({
+                    "word": w["word"],
+                    "start": w["start"],
+                    "end": w["end"],
+                    "probability": w.get("confidence", 0.0),
                 })
-        
-        transcript_segments.append(seg_dict)
-        full_text += segment.text + " "
-        
+                seg_text += w["word"] + " "
+                if w.get("punctuated_word", "").rstrip().endswith((".", "!", "?")):
+                    transcript_segments.append({
+                        "text": seg_text.strip(),
+                        "start": seg_start,
+                        "end": w["end"],
+                        "words": seg_words,
+                    })
+                    print(f"   [{seg_start:.2f}s -> {w['end']:.2f}s] {seg_text.strip()}")
+                    seg_words = []
+                    seg_text = ""
+                    seg_start = w["end"]
+            if seg_words:
+                transcript_segments.append({
+                    "text": seg_text.strip(),
+                    "start": seg_start,
+                    "end": seg_words[-1]["end"],
+                    "words": seg_words,
+                })
+                print(f"   [{seg_start:.2f}s -> {seg_words[-1]['end']:.2f}s] {seg_text.strip()}")
+
+    elapsed = time.time() - step_start
+    print(f"✅ Transcription complete in {elapsed:.1f}s (Deepgram Nova-3, lang={detected_lang})")
+
     return {
-        'text': full_text.strip(),
-        'segments': transcript_segments,
-        'language': info.language
+        "text": full_text.strip(),
+        "segments": transcript_segments,
+        "language": detected_lang,
     }
 
-def get_viral_clips(transcript_result, video_duration):
-    print("🤖  Analyzing with Gemini...")
-    
-    api_key = os.getenv("GEMINI_API_KEY")
+
+def _transcribe_whisper(video_path):
+    """Fallback: transcribe using local Faster-Whisper on CPU."""
+    print("🎙️  Transcribing video with Faster-Whisper (CPU fallback)...")
+    from faster_whisper import WhisperModel
+
+    model = WhisperModel("base", device="cpu", compute_type="int8")
+    segments, info = model.transcribe(video_path, word_timestamps=True)
+
+    print(f"   Detected language '{info.language}' with probability {info.language_probability:.2f}")
+
+    transcript_segments = []
+    full_text = ""
+
+    for segment in segments:
+        print(f"   [{segment.start:.2f}s -> {segment.end:.2f}s] {segment.text}")
+        seg_dict = {
+            "text": segment.text,
+            "start": segment.start,
+            "end": segment.end,
+            "words": [],
+        }
+        if segment.words:
+            for word in segment.words:
+                seg_dict["words"].append({
+                    "word": word.word,
+                    "start": word.start,
+                    "end": word.end,
+                    "probability": word.probability,
+                })
+        transcript_segments.append(seg_dict)
+        full_text += segment.text + " "
+
+    return {
+        "text": full_text.strip(),
+        "segments": transcript_segments,
+        "language": info.language,
+    }
+
+def get_viral_clips(transcript_result, video_duration, num_clips=None, min_duration=None, max_duration=None):
+    n = num_clips or DEFAULT_NUM_CLIPS
+    mn = min_duration or DEFAULT_MIN_DURATION
+    mx = max_duration or DEFAULT_MAX_DURATION
+    print(f"🤖  Analyzing with OpenAI GPT-5.5 — requesting {n} clips ({mn}–{mx}s each)...")
+
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        print("❌ Error: GEMINI_API_KEY not found in environment variables.")
+        print("❌ Error: OPENAI_API_KEY not found in environment variables.")
         return None
 
+    client = OpenAI(api_key=api_key)
+    model_name = 'gpt-5.5'
 
-    client = genai.Client(api_key=api_key)
-    
-    # We use gemini-2.5-flash as requested.
-    model_name = 'gemini-2.5-flash' 
-    
-    print(f"🤖  Initializing Gemini with model: {model_name}")
+    print(f"🤖  Initializing OpenAI with model: {model_name}")
 
-    # Extract words
     words = []
     for segment in transcript_result['segments']:
         for word in segment.get('words', []):
@@ -820,31 +936,34 @@ def get_viral_clips(transcript_result, video_duration):
                 'e': word['end']
             })
 
-    prompt = GEMINI_PROMPT_TEMPLATE.format(
+    prompt = CLIP_PROMPT_TEMPLATE.format(
+        num_clips=n,
+        min_duration=mn,
+        max_duration=mx,
         video_duration=video_duration,
         transcript_text=json.dumps(transcript_result['text']),
         words_json=json.dumps(words)
     )
 
     try:
-        response = client.models.generate_content(
+        response = client.chat.completions.create(
             model=model_name,
-            contents=prompt
+            messages=[
+                {"role": "system", "content": "You are a senior short-form video editor. Return ONLY valid JSON, no markdown."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
         )
         
-        # --- Cost Calculation ---
+        cost_analysis = None
         try:
-            usage = response.usage_metadata
+            usage = response.usage
             if usage:
-                # Gemini 2.5 Flash Pricing (Dec 2025)
-                # Input: $0.10 per 1M tokens
-                # Output: $0.40 per 1M tokens
+                input_price_per_million = 3.00
+                output_price_per_million = 15.00
                 
-                input_price_per_million = 0.10
-                output_price_per_million = 0.40
-                
-                prompt_tokens = usage.prompt_token_count
-                output_tokens = usage.candidates_token_count
+                prompt_tokens = usage.prompt_tokens
+                output_tokens = usage.completion_tokens
                 
                 input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
                 output_cost = (output_tokens / 1_000_000) * output_price_per_million
@@ -866,11 +985,8 @@ def get_viral_clips(transcript_result, video_duration):
                 
         except Exception as e:
             print(f"⚠️ Could not calculate cost: {e}")
-            cost_analysis = None
-        # ------------------------
 
-        # Clean response if it contains markdown code blocks
-        text = response.text
+        text = response.choices[0].message.content
         if text.startswith("```json"):
             text = text[7:]
         if text.endswith("```"):
@@ -883,7 +999,7 @@ def get_viral_clips(transcript_result, video_duration):
             
         return result_json
     except Exception as e:
-        print(f"❌ Gemini Error: {e}")
+        print(f"❌ OpenAI Error: {e}")
         return None
 
 if __name__ == '__main__':
@@ -896,6 +1012,9 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', type=str, help="Output directory or file (if processing whole video).")
     parser.add_argument('--keep-original', action='store_true', help="Keep the downloaded YouTube video.")
     parser.add_argument('--skip-analysis', action='store_true', help="Skip AI analysis and convert the whole video.")
+    parser.add_argument('--num-clips', type=int, default=None, help="Number of clips to generate.")
+    parser.add_argument('--min-duration', type=int, default=None, help="Minimum clip duration in seconds.")
+    parser.add_argument('--max-duration', type=int, default=None, help="Maximum clip duration in seconds.")
     
     args = parser.parse_args()
 
@@ -960,7 +1079,12 @@ if __name__ == '__main__':
         cap.release()
 
         # 4. Gemini Analysis
-        clips_data = get_viral_clips(transcript, duration)
+        clips_data = get_viral_clips(
+            transcript, duration,
+            num_clips=args.num_clips,
+            min_duration=args.min_duration,
+            max_duration=args.max_duration,
+        )
         
         if not clips_data or 'shorts' not in clips_data:
             print("❌ Failed to identify clips. Converting whole video as fallback.")
@@ -991,12 +1115,15 @@ if __name__ == '__main__':
                 # ffmpeg cut
                 # Using re-encoding for precision as requested by strict seconds
                 cut_command = [
-                    'ffmpeg', '-y', 
-                    '-ss', str(start), 
-                    '-to', str(end), 
+                    'ffmpeg', '-y',
+                    '-ss', str(start),
+                    '-to', str(end),
                     '-i', input_video,
-                    '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
-                    '-c:a', 'aac',
+                    '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                    '-profile:v', 'high', '-level', '4.0',
+                    '-crf', '16', '-preset', 'medium',
+                    '-c:a', 'aac', '-b:a', '192k',
+                    '-movflags', '+faststart',
                     clip_temp_path
                 ]
                 subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

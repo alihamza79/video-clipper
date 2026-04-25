@@ -2,16 +2,32 @@ import os
 import uuid
 import time
 import json
-from google import genai
-from google.genai import types
+from openai import OpenAI
 from PIL import Image
+
+
+def _parse_json_response(text):
+    """Clean and parse JSON from LLM response."""
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+
+    start_idx = text.find('{')
+    end_idx = text.rfind('}')
+    if start_idx != -1 and end_idx != -1:
+        text = text[start_idx:end_idx + 1]
+
+    return json.loads(text)
 
 
 def analyze_video_for_titles(api_key, video_path, transcript=None):
     """
-    Transcribes a video and uses Gemini to suggest viral YouTube titles.
+    Transcribes a video and uses GPT-5.5 to suggest viral YouTube titles.
     If transcript is provided, skips Whisper transcription.
-    Returns: { "titles": [...], "transcript_summary": "...", "language": "...", "segments": [...], "video_duration": ... }
     """
     if transcript is None:
         from main import transcribe_video
@@ -20,21 +36,11 @@ def analyze_video_for_titles(api_key, video_path, transcript=None):
     else:
         print("🎬 [Thumbnail] Using pre-computed transcript (Whisper already done)...")
 
-    print("📤 [Thumbnail] Uploading video to Gemini...")
-    client = genai.Client(api_key=api_key)
-
-    file_upload = client.files.upload(file=video_path)
-    while True:
-        file_info = client.files.get(name=file_upload.name)
-        if file_info.state == "ACTIVE":
-            break
-        elif file_info.state == "FAILED":
-            raise Exception("Video processing failed by Gemini.")
-        time.sleep(2)
+    client = OpenAI(api_key=api_key)
 
     prompt = f"""You are a YouTube title expert who creates viral, click-worthy titles.
 
-Analyze this video and its transcript, then suggest 10 YouTube titles that would maximize CTR (click-through rate).
+Analyze this transcript, then suggest 10 YouTube titles that would maximize CTR (click-through rate).
 
 TRANSCRIPT:
 {transcript['text']}
@@ -63,42 +69,28 @@ OUTPUT JSON:
     ]
 }}"""
 
-    print("🤖 [Thumbnail] Asking Gemini for title suggestions...")
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[file_upload, prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json"
-        )
+    print("🤖 [Thumbnail] Asking GPT-5.5 for title suggestions...")
+    response = client.chat.completions.create(
+        model="gpt-5.5",
+        messages=[
+            {"role": "system", "content": "You are a YouTube title expert. Return ONLY valid JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
     )
 
-    # Extract segments and duration from transcript for later use
     segments = transcript.get("segments", [])
     video_duration = segments[-1]["end"] if segments else 0
 
     try:
-        text = response.text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
-        start_idx = text.find('{')
-        end_idx = text.rfind('}')
-        if start_idx != -1 and end_idx != -1:
-            text = text[start_idx:end_idx + 1]
-
-        result = json.loads(text)
+        result = _parse_json_response(response.choices[0].message.content)
         result["transcript_summary"] = result.get("transcript_summary", "")
         result["language"] = result.get("language", transcript["language"])
         result["segments"] = segments
         result["video_duration"] = video_duration
         return result
     except json.JSONDecodeError:
-        print(f"❌ [Thumbnail] Failed to parse titles JSON: {response.text}")
+        print(f"❌ [Thumbnail] Failed to parse titles JSON")
         return {
             "titles": ["Could not generate titles - please try again"],
             "transcript_summary": transcript["text"][:500],
@@ -112,7 +104,7 @@ def refine_titles(api_key, context, user_message, conversation_history=None):
     """
     Takes video context + user feedback and returns refined title suggestions.
     """
-    client = genai.Client(api_key=api_key)
+    client = OpenAI(api_key=api_key)
 
     history_text = ""
     if conversation_history:
@@ -142,126 +134,71 @@ OUTPUT JSON:
     "titles": ["title1", "title2", ...]
 }}"""
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json"
-        )
+    response = client.chat.completions.create(
+        model="gpt-5.5",
+        messages=[
+            {"role": "system", "content": "You are a YouTube title expert. Return ONLY valid JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
     )
 
     try:
-        text = response.text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
-        start_idx = text.find('{')
-        end_idx = text.rfind('}')
-        if start_idx != -1 and end_idx != -1:
-            text = text[start_idx:end_idx + 1]
-
-        return json.loads(text)
+        return _parse_json_response(response.choices[0].message.content)
     except json.JSONDecodeError:
-        print(f"❌ [Thumbnail] Failed to parse refined titles: {response.text}")
+        print(f"❌ [Thumbnail] Failed to parse refined titles")
         return {"titles": ["Could not refine titles - please try again"]}
 
 
 def generate_thumbnail(api_key, title, session_id, face_image_path=None, bg_image_path=None, extra_prompt="", count=3, video_context=""):
     """
-    Generates YouTube thumbnails using Gemini image generation.
+    Generates YouTube thumbnails using OpenAI image generation (DALL-E).
     Returns list of saved image paths (relative URLs).
     """
-    client = genai.Client(api_key=api_key)
+    client = OpenAI(api_key=api_key)
 
     output_dir = os.path.join("output", "thumbnails", session_id)
     os.makedirs(output_dir, exist_ok=True)
 
-    prompt_parts = []
-
-    # Add face image if provided
-    if face_image_path and os.path.exists(face_image_path):
-        face_img = Image.open(face_image_path)
-        prompt_parts.append(face_img)
-
-    # Add background image if provided
-    if bg_image_path and os.path.exists(bg_image_path):
-        bg_img = Image.open(bg_image_path)
-        prompt_parts.append(bg_img)
-
-    # Build video context block
     context_block = ""
     if video_context:
-        context_block = f"""
-VIDEO CONTEXT (use this to understand the video and design a relevant thumbnail):
-{video_context}
-"""
+        context_block = f"\nVIDEO CONTEXT: {video_context}\n"
 
-    # Build extra instructions block (high priority)
     extra_block = ""
     if extra_prompt:
-        extra_block = f"""
-⚠️ MANDATORY USER INSTRUCTIONS (MUST follow these exactly — they override any default behavior):
-{extra_prompt}
-"""
+        extra_block = f"\nMANDATORY USER INSTRUCTIONS: {extra_prompt}\n"
 
     text_prompt = f"""Generate a professional, eye-catching YouTube thumbnail image.
 
-VIDEO TITLE (for reference — do NOT put the full title on the thumbnail): "{title}"
+VIDEO TITLE: "{title}"
 {context_block}
-TEXT ON THE THUMBNAIL:
-- Based on the title AND the video context, create a SHORT visual hook: 1 to 5 words maximum
-- It should capture the core emotion, surprise, or promise of the video
-- The thumbnail text should COMPLEMENT the YouTube title (which appears below), not repeat it
-- Examples: "$10K EN 30 DÍAS", "ESTO FUNCIONA", "NO LO SABÍAS", "GRATIS 🔥"
-- Use ALL CAPS for maximum impact, split into 2-3 lines
+TEXT ON THUMBNAIL: Based on the title, create a SHORT visual hook (1-5 words max) in ALL CAPS.
 {extra_block}
-DESIGN REQUIREMENTS:
-- The text MUST be large, bold, and high-contrast (readable at small sizes)
-- Use vibrant, eye-catching colors that match the video's mood
-- Professional YouTube thumbnail aesthetic
-- Clean composition — text and face/subject as clear focal points
-- NO clutter, NO small text, NO watermarks"""
-
-    if face_image_path and os.path.exists(face_image_path):
-        text_prompt += "\n- Include the provided face/person prominently with an exaggerated expression (surprise, excitement, shock)"
-
-    if bg_image_path and os.path.exists(bg_image_path):
-        text_prompt += "\n- Use the provided background image as the base/backdrop"
-
-    prompt_parts.append(text_prompt)
+DESIGN: Large bold high-contrast text, vibrant colors, professional YouTube thumbnail aesthetic, clean composition, NO clutter."""
 
     thumbnails = []
     last_error = None
     for i in range(count):
         print(f"🎨 [Thumbnail] Generating thumbnail {i + 1}/{count}...")
         try:
-            response = client.models.generate_content(
-                model="gemini-3.1-flash-image-preview",
-                contents=prompt_parts,
-                config=types.GenerateContentConfig(
-                    response_modalities=["TEXT", "IMAGE"],
-                    image_config=types.ImageConfig(
-                        aspect_ratio="16:9",
-                        image_size="2K"
-                    )
-                )
+            response = client.images.generate(
+                model="dall-e-3",
+                prompt=text_prompt,
+                size="1792x1024",
+                quality="hd",
+                n=1,
             )
 
-            for part in response.parts:
-                if part.text is not None:
-                    print(f"📝 [Thumbnail] Gemini text: {part.text}")
-                elif image := part.as_image():
-                    filename = f"thumb_{i + 1}.jpg"
-                    filepath = os.path.join(output_dir, filename)
-                    image.save(filepath)
-                    thumbnails.append(f"/thumbnails/{session_id}/{filename}")
-                    print(f"✅ [Thumbnail] Saved: {filepath}")
-                    break
+            image_url = response.data[0].url
+
+            import httpx
+            img_response = httpx.get(image_url, timeout=30.0)
+            filename = f"thumb_{i + 1}.jpg"
+            filepath = os.path.join(output_dir, filename)
+            with open(filepath, "wb") as f:
+                f.write(img_response.content)
+            thumbnails.append(f"/thumbnails/{session_id}/{filename}")
+            print(f"✅ [Thumbnail] Saved: {filepath}")
 
         except Exception as e:
             last_error = str(e)
@@ -275,12 +212,10 @@ DESIGN REQUIREMENTS:
 
 def generate_youtube_description(api_key, title, transcript_segments, language, video_duration):
     """
-    Uses Gemini to generate a YouTube description with chapter markers from transcript segments.
-    Returns: { "description": "full description text with chapters" }
+    Uses GPT-5.5 to generate a YouTube description with chapter markers.
     """
-    client = genai.Client(api_key=api_key)
+    client = OpenAI(api_key=api_key)
 
-    # Format segments for the prompt
     formatted_segments = []
     for seg in transcript_segments:
         start = seg.get("start", 0)
@@ -291,12 +226,11 @@ def generate_youtube_description(api_key, title, transcript_segments, language, 
 
     segments_text = "\n".join(formatted_segments)
 
-    # Format total duration
     dur_mins = int(video_duration // 60)
     dur_secs = int(video_duration % 60)
     duration_str = f"{dur_mins}:{dur_secs:02d}"
 
-    prompt = f"""You are a YouTube SEO expert. Generate a complete YouTube video description for the following video.
+    prompt = f"""You are a YouTube SEO expert. Generate a complete YouTube video description.
 
 VIDEO TITLE: "{title}"
 VIDEO LANGUAGE: {language}
@@ -306,28 +240,25 @@ TRANSCRIPT WITH TIMESTAMPS:
 {segments_text}
 
 REQUIREMENTS:
-1. Write the description in the SAME LANGUAGE as the video ({language})
+1. Write in the SAME LANGUAGE as the video ({language})
 2. Start with a compelling 2-3 sentence summary/hook
 3. Add relevant CTAs (subscribe, like, comment)
-4. Generate YouTube CHAPTERS based on the transcript timestamps:
-   - First chapter MUST start at 0:00
-   - Minimum 3 chapters, each at least 10 seconds apart
-   - Chapter titles should be concise and descriptive
-   - Format: 0:00 Chapter Title
-   - Place chapters in their own section with a blank line before and after
+4. Generate YouTube CHAPTERS (first chapter at 0:00, min 3 chapters, 10s+ apart)
 5. Add 5-10 relevant hashtags at the end
-6. Keep the total description under 5000 characters
+6. Keep under 5000 characters
 
-OUTPUT: Return ONLY the description text (no JSON wrapper, no markdown code blocks). The description should be ready to paste directly into YouTube."""
+OUTPUT: Return ONLY the description text, ready to paste into YouTube."""
 
     print("🤖 [Thumbnail] Generating YouTube description with chapters...")
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[prompt],
+    response = client.chat.completions.create(
+        model="gpt-5.5",
+        messages=[
+            {"role": "system", "content": "You are a YouTube SEO expert. Return only the description text, no JSON or markdown wrappers."},
+            {"role": "user", "content": prompt}
+        ],
     )
 
-    description = response.text.strip()
-    # Clean up any accidental markdown wrappers
+    description = response.choices[0].message.content.strip()
     if description.startswith("```"):
         lines = description.split("\n")
         description = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])

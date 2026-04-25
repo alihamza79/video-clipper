@@ -23,7 +23,7 @@ export default function KeyInput({ onKeySet, savedKey }) {
                 <div className="p-2 bg-accent/20 rounded-lg text-accent">
                     <Key size={20} />
                 </div>
-                <h2 className="text-lg font-semibold">Gemini API Key</h2>
+                <h2 className="text-lg font-semibold">OpenAI API Key</h2>
             </div>
 
             <div className="flex gap-3">
@@ -35,7 +35,7 @@ export default function KeyInput({ onKeySet, savedKey }) {
                             setKey(e.target.value);
                             setIsSaved(false);
                         }}
-                        placeholder="AIzaSy..."
+                        placeholder="sk-..."
                         className="input-field pr-12 font-mono"
                     />
                     <button
@@ -60,12 +60,12 @@ export default function KeyInput({ onKeySet, savedKey }) {
                 Your key is stored locally in your browser for convenience.
                 <br />
                 <a
-                    href="https://aistudio.google.com/app/apikey"
+                    href="https://platform.openai.com/api-keys"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-primary hover:underline mt-1 inline-block"
                 >
-                    Get your free Gemini API Key here →
+                    Get your OpenAI API Key here →
                 </a>
             </p>
         </div>

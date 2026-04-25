@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload } from 'lucide-react';
-import { getApiUrl } from '../config';
+import { getApiUrl, getVideoUrl } from '../config';
 
 const STYLE_OPTIONS = [
   { id: 'ugc', label: 'UGC Natural', desc: 'Authentic, talking to camera' },
@@ -34,7 +34,7 @@ function saveCache(url, analysis, webResearch, scripts) {
   } catch { /* localStorage full */ }
 }
 
-export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uploadPostKey, uploadUserId }) {
+export default function SaaShortsTab({ openaiApiKey, elevenLabsKey, falKey, uploadPostKey, uploadUserId }) {
   // Wizard state
   const [step, setStep] = useState(() => {
     const cache = loadCache();
@@ -186,8 +186,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
 
   const handleAnalyze = async () => {
     if (!url.trim() && !description.trim()) return;
-    if (!geminiApiKey) {
-      setAnalyzeError('Gemini API key required. Set it in Settings.');
+    if (!openaiApiKey) {
+      setAnalyzeError('OpenAI API key required. Set it in Settings.');
       return;
     }
 
@@ -199,7 +199,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Gemini-Key': geminiApiKey,
+          'X-OpenAI-Key': openaiApiKey,
         },
         body: JSON.stringify({
           url: url.trim() || undefined,
@@ -1309,7 +1309,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                 {/* Video Player */}
                 <div className="aspect-[9/16] max-h-[500px] bg-black rounded-xl overflow-hidden relative">
                   <video
-                    src={getApiUrl(genResult.video_url)}
+                    src={getVideoUrl(genResult.video_url)}
                     controls
                     className="w-full h-full object-contain"
                     autoPlay
@@ -1381,7 +1381,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                   {/* Actions */}
                   <div className="flex gap-3 pt-2">
                     <a
-                      href={getApiUrl(genResult.video_url)}
+                      href={getVideoUrl(genResult.video_url)}
                       download
                       className="btn-primary px-4 py-2 text-sm flex items-center gap-2"
                     >

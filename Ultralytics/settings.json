@@ -1,0 +1,21 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "/Users/alihamza/Desktop/openshorts/datasets",
+  "weights_dir": "/Users/alihamza/Desktop/openshorts/weights",
+  "runs_dir": "/Users/alihamza/Desktop/openshorts/runs",
+  "uuid": "2c3a3f4c4b15a5e348e5bda8888fe03da6a38fa3b11a9e52f3616e58cb41d393",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": true
+}

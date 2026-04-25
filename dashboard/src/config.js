@@ -4,9 +4,17 @@
 
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
+
 export const getApiUrl = (path) => {
     if (path.startsWith('http')) return path;
-    // Ensure path starts with / if not present
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     return `${API_BASE_URL}${normalizedPath}`;
+};
+
+export const getVideoUrl = (path) => {
+    if (path.startsWith('http')) return path;
+    const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+    if (API_BASE_URL) return `${API_BASE_URL}${normalizedPath}`;
+    return `${BACKEND_URL}${normalizedPath}`;
 };

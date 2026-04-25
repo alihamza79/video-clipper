@@ -1,0 +1,32 @@
+app = "vedioclipper"
+primary_region = "sin"  # Singapore - closest to you, or use "bom" for Mumbai
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+  MPLCONFIGDIR = "/tmp/matplotlib"
+  HF_HOME = "/tmp/huggingface"
+  YOLO_CONFIG_DIR = "/tmp/ultralytics"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "suspend"  # Save money - sleep when idle
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 2
+  memory_mb = 2048  # 2GB - enough for video processing
+
+# Persistent storage for generated clips
+[[mounts]]
+  source = "clips_data"
+  destination = "/app/output"
+
+[mounts.options]
+  size_gb = 3  # 3GB free persistent storage

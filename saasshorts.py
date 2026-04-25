@@ -37,25 +37,22 @@ DEFAULT_VOICES = {
 }
 
 
-GEMINI_MODEL = "gemini-3-flash-preview"
+OPENAI_MODEL = "gpt-5.5"
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Phase 1: Website Scraping, Web Research & Analysis
 # ═══════════════════════════════════════════════════════════════════════
 
-def research_saas_online(url: str, gemini_key: str) -> dict:
+def research_saas_online(url: str, openai_key: str) -> dict:
     """
-    Use Gemini with Google Search grounding to deeply research a SaaS product
-    across the internet: reviews, Reddit threads, Twitter, competitor comparisons,
-    pricing complaints, user testimonials, etc.
+    Use GPT-5.5 to deeply research a SaaS product based on its URL.
     """
-    from google import genai
-    from google.genai import types
+    from openai import OpenAI
 
-    print(f"[SaaSShorts] 🔍 Researching {url} across the web (Google Search grounding)...")
+    print(f"[SaaSShorts] 🔍 Researching {url} across the web...")
 
-    client = genai.Client(api_key=gemini_key)
+    client = OpenAI(api_key=openai_key)
 
     # Extract domain name for search queries
     domain = url.replace("https://", "").replace("http://", "").split("/")[0]
@@ -100,29 +97,17 @@ Return a comprehensive JSON research report:
 
 Be thorough. Use REAL data from your search results, not made-up information."""
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-        ),
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a world-class SaaS market researcher. Return ONLY valid JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
     )
 
-    # Extract grounding sources
     sources = []
-    try:
-        metadata = response.candidates[0].grounding_metadata
-        if metadata and metadata.grounding_chunks:
-            for chunk in metadata.grounding_chunks:
-                if chunk.web:
-                    sources.append({"title": chunk.web.title, "url": chunk.web.uri})
-        if metadata and metadata.web_search_queries:
-            print(f"[SaaSShorts]   Searches performed: {metadata.web_search_queries}")
-    except Exception:
-        pass
-
-    # Parse response text as JSON
-    raw = response.text
+    raw = response.choices[0].message.content
     if not raw:
         print("[SaaSShorts] ⚠️ Gemini returned empty response for web research")
         return {"raw_research": "", "product_name": domain, "grounding_sources": sources}
@@ -236,17 +221,16 @@ def scrape_website(url: str) -> dict:
     return result
 
 
-def analyze_saas(scraped_data: dict, gemini_key: str, web_research: dict = None) -> dict:
+def analyze_saas(scraped_data: dict, openai_key: str, web_research: dict = None) -> dict:
     """
     Deep analysis of a SaaS product combining website scraping + web research.
-    Uses Gemini 3 Flash for synthesis.
+    Uses GPT-5.5 for synthesis.
     """
-    from google import genai
-    from google.genai import types
+    from openai import OpenAI
 
     print(f"[SaaSShorts] 🧠 Analyzing {scraped_data['url']} (with web research)...")
 
-    client = genai.Client(api_key=gemini_key)
+    client = OpenAI(api_key=openai_key)
 
     # Build web research context
     research_context = ""
@@ -332,15 +316,18 @@ Return a JSON object:
 IMPORTANT: Use REAL pain points from user reviews when available. Real frustrations make the best UGC content.
 Include 5-8 pain points, 4-6 emotional hooks, and 4+ viral angles."""
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt],
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "You are an expert SaaS marketing analyst. Return ONLY valid JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
     )
 
-    raw = response.text
+    raw = response.choices[0].message.content
     if not raw:
-        raise Exception("Gemini returned empty response for SaaS analysis")
+        raise Exception("OpenAI returned empty response for SaaS analysis")
 
     text = raw.strip()
     if text.startswith("```"):
@@ -367,20 +354,19 @@ Include 5-8 pain points, 4-6 emotional hooks, and 4+ viral angles."""
 
 def generate_scripts(
     analysis: dict,
-    gemini_key: str,
+    openai_key: str,
     num_scripts: int = 3,
     style: str = "ugc",
     language: str = "en",
     actor_gender: str = "female",
 ) -> list:
     """Generate video scripts based on SaaS analysis."""
-    from google import genai
-    from google.genai import types
+    from openai import OpenAI
 
     lang_name = "Spanish" if language == "es" else "English"
     print(f"[SaaSShorts] 📝 Generating {num_scripts} scripts ({style}, {lang_name})...")
 
-    client = genai.Client(api_key=gemini_key)
+    client = OpenAI(api_key=openai_key)
 
     style_guide = {
         "ugc": "Natural, authentic UGC style. Person talking to camera like sharing a discovery with a friend. Casual, genuine.",
@@ -514,18 +500,19 @@ RULES:
 - Example female: "a 26 year old attractive european woman, light brown wavy hair, wearing a white tank top, natural minimal makeup, friendly face"
 - Example male: "a 29 year old european man, short dark hair, light stubble, wearing a navy t-shirt, smart casual look" """
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            max_output_tokens=8192,
-        ),
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a viral UGC video script writer. Return ONLY valid JSON array."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
+        max_completion_tokens=8192,
     )
 
-    raw = response.text
+    raw = response.choices[0].message.content
     if not raw:
-        raise Exception("Gemini returned empty response for script generation")
+        raise Exception("OpenAI returned empty response for script generation")
 
     text = raw.strip()
     if text.startswith("```"):

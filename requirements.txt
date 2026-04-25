@@ -5,7 +5,7 @@ torchvision
 tqdm
 yt-dlp
 faster-whisper
-google-genai
+openai
 python-dotenv
 mediapipe==0.10.14
 boto3

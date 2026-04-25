@@ -14,25 +14,12 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 def upload_file_to_s3(file_path, bucket_name, s3_key):
-    """
-    Upload a file to an S3 bucket silently.
-    """
-    access_key = os.environ.get('AWS_ACCESS_KEY_ID')
-    secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
-    region = os.environ.get('AWS_REGION', 'eu-west-3')
-
-    if not access_key or not secret_key:
+    """Upload a file to S3/R2 bucket silently."""
+    s3_client = get_s3_client()
+    if not s3_client:
         return False
 
-    s3_client = boto3.client(
-        's3',
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-        region_name=region
-    )
     try:
-        # Extra arguments for public read if needed, but the user didn't specify.
-        # Given the bucket name, it might be for a web app.
         s3_client.upload_file(file_path, bucket_name, s3_key)
         return True
     except ClientError:
@@ -45,6 +32,20 @@ from botocore.config import Config
 import json
 import time as time_module
 
+
+def _get_public_base_url():
+    """Build the base URL for public objects. Uses R2_PUBLIC_URL if set, else falls back to S3 format."""
+    public_url = os.environ.get('R2_PUBLIC_URL')
+    if public_url:
+        return public_url.rstrip('/')
+    r2_endpoint = os.environ.get('R2_ENDPOINT')
+    if r2_endpoint:
+        bucket = os.environ.get('AWS_S3_PUBLIC_BUCKET', os.environ.get('AWS_S3_BUCKET', ''))
+        return f"{r2_endpoint.rstrip('/')}/{bucket}"
+    bucket = os.environ.get('AWS_S3_PUBLIC_BUCKET', 'my-public-bucket')
+    region = os.environ.get('AWS_REGION', 'eu-west-3')
+    return f"https://{bucket}.s3.{region}.amazonaws.com"
+
 # Simple in-memory cache for gallery clips
 _clips_cache = {
     "data": None,
@@ -53,21 +54,25 @@ _clips_cache = {
 CACHE_TTL_SECONDS = 300  # 5 minutes
 
 def get_s3_client():
-    """Returns an authenticated S3 client."""
+    """Returns an authenticated S3/R2 client. Supports Cloudflare R2 via R2_ENDPOINT."""
     access_key = os.environ.get('AWS_ACCESS_KEY_ID')
     secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
-    region = os.environ.get('AWS_REGION', 'eu-west-3')
+    region = os.environ.get('AWS_REGION', 'auto')
+    r2_endpoint = os.environ.get('R2_ENDPOINT')
 
-    if not access_key or not secret_key:
+    if not access_key or not secret_key or 'your_' in access_key or access_key == 'your_aws_access_key_here':
         return None
 
-    return boto3.client(
-        's3',
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-        region_name=region,
-        config=Config(signature_version='s3v4')
-    )
+    kwargs = {
+        'aws_access_key_id': access_key,
+        'aws_secret_access_key': secret_key,
+        'region_name': region,
+        'config': Config(signature_version='s3v4'),
+    }
+    if r2_endpoint:
+        kwargs['endpoint_url'] = r2_endpoint
+
+    return boto3.client('s3', **kwargs)
 
 def generate_presigned_url(bucket_name, object_key, expiration=3600):
     """Generate a presigned URL to share an S3 object."""
@@ -218,7 +223,7 @@ def upload_actor_to_s3(file_path, description=""):
             file_path, bucket_name, s3_key,
             ExtraArgs={'ContentType': 'image/png'},
         )
-        public_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{s3_key}"
+        public_url = f"{_get_public_base_url()}/{s3_key}"
 
         # Save metadata JSON alongside the image
         if description:
@@ -276,7 +281,7 @@ def list_actor_gallery():
                 continue
             obj = data['image']
             key = obj['Key']
-            public_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{key}"
+            public_url = f"{_get_public_base_url()}/{key}"
             entry = {
                 "url": public_url,
                 "key": key,
@@ -297,7 +302,7 @@ def list_actor_gallery():
         return images
 
     except Exception as e:
-        logger.error(f"Failed to list actor gallery: {e}")
+        logger.debug(f"Failed to list actor gallery: {e}")
         return []
 
 
@@ -324,7 +329,7 @@ def upload_video_to_gallery(video_path, actor_image_path, metadata, video_id=Non
     if not video_id:
         video_id = str(uuid.uuid4())[:8]
 
-    base_url = f"https://{bucket_name}.s3.{region}.amazonaws.com"
+    base_url = _get_public_base_url()
     results = {}
 
     try:
@@ -418,7 +423,7 @@ def list_video_gallery(limit=50, force_refresh=False):
                 continue
 
     except Exception as e:
-        logger.error(f"Failed to list video gallery: {e}")
+        logger.debug(f"Failed to list video gallery: {e}")
         return []
 
     _video_gallery_cache["data"] = videos

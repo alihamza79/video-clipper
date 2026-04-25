@@ -1,16 +1,16 @@
 import React, { useState, useEffect } from 'react';
 import { Download, Share2, Instagram, Youtube, Video, CheckCircle, AlertCircle, X, Loader2, Copy, Wand2, Type, Calendar, Clock, Languages } from 'lucide-react';
-import { getApiUrl } from '../config';
+import { getApiUrl, getVideoUrl } from '../config';
 import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
 import { renderInBrowser } from '../lib/renderInBrowser';
 
-export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, onPlay, onPause }) {
+export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUserId, openaiApiKey, elevenLabsKey, onPlay, onPause }) {
     const [showModal, setShowModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
     const videoRef = React.useRef(null);
-    const originalVideoUrl = getApiUrl(clip.video_url); // Never changes — used for Remotion previews
+    const originalVideoUrl = getVideoUrl(clip.video_url);
     const [currentVideoUrl, setCurrentVideoUrl] = useState(originalVideoUrl);
 
     const [platforms, setPlatforms] = useState({
@@ -65,10 +65,10 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
         setIsEditing(true);
         setEditError(null);
         try {
-            const apiKey = geminiApiKey || localStorage.getItem('gemini_key');
+            const apiKey = openaiApiKey || localStorage.getItem('openai_key');
 
             if (!apiKey) {
-                throw new Error("Gemini API Key is missing. Please set it in Settings.");
+                throw new Error("OpenAI API Key is missing. Please set it in Settings.");
             }
 
             // Try Remotion effects endpoint first
@@ -76,7 +76,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-Gemini-Key': apiKey
+                    'X-OpenAI-Key': apiKey
                 },
                 body: JSON.stringify({
                     job_id: jobId,
@@ -88,8 +88,17 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             if (effectsRes.ok) {
                 const data = await effectsRes.json();
                 if (data.effects && data.effects.segments) {
-                    setCompositionParams(prev => ({ ...prev, effects: data.effects }));
-                    setShowPreviewModal(true);
+                    const newLayers = { ...activeLayers, effects: data.effects };
+                    setActiveLayers(newLayers);
+                    const blobUrl = await renderInBrowser({
+                        videoUrl: originalVideoUrl,
+                        durationInSeconds: clipDuration,
+                        subtitles: newLayers.subtitles,
+                        hook: newLayers.hook,
+                        effects: newLayers.effects,
+                    });
+                    setCurrentVideoUrl(blobUrl);
+                    if (videoRef.current) videoRef.current.load();
                     return;
                 }
             }
@@ -99,7 +108,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-Gemini-Key': apiKey
+                    'X-OpenAI-Key': apiKey
                 },
                 body: JSON.stringify({
                     job_id: jobId,
@@ -120,7 +129,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
             const data = await res.json();
             if (data.new_video_url) {
-                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                setCurrentVideoUrl(getVideoUrl(data.new_video_url));
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
@@ -177,7 +186,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             if (!res.ok) throw new Error(await res.text());
             const data = await res.json();
             if (data.new_video_url) {
-                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                setCurrentVideoUrl(getVideoUrl(data.new_video_url));
                 if (videoRef.current) videoRef.current.load();
                 setShowSubtitleModal(false);
             }
@@ -231,7 +240,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             if (!res.ok) throw new Error(await res.text());
             const data = await res.json();
             if (data.new_video_url) {
-                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                setCurrentVideoUrl(getVideoUrl(data.new_video_url));
                 if (videoRef.current) videoRef.current.load();
                 setShowHookModal(false);
             }
@@ -290,7 +299,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             const data = await res.json();
             console.log('[Translate] Success response:', data);
             if (data.new_video_url) {
-                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                setCurrentVideoUrl(getVideoUrl(data.new_video_url));
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
@@ -487,6 +496,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                         {isHooking ? 'Adding...' : 'Viral Hook'}
                     </button>
 
+                    {/* Dub Voice button - disabled for now
                     <button
                         onClick={() => setShowTranslateModal(true)}
                         disabled={isTranslating}
@@ -495,13 +505,16 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                         {isTranslating ? <Loader2 size={14} className="animate-spin" /> : <Languages size={14} />}
                         {isTranslating ? 'Translating...' : 'Dub Voice'}
                     </button>
+                    */}
 
+                    {/* Post button - disabled for now
                     <button
                         onClick={() => setShowModal(true)}
                         className="col-span-1 py-2 bg-primary hover:bg-blue-600 text-white rounded-lg text-xs font-bold shadow-lg shadow-primary/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 truncate px-2"
                     >
                         <Share2 size={14} className="shrink-0" /> Post
                     </button>
+                    */}
                     <button
                         onClick={async (e) => {
                             e.preventDefault();

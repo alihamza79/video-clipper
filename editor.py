@@ -3,39 +3,19 @@ import json
 import re
 import subprocess
 import time
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 class VideoEditor:
     def __init__(self, api_key):
-        self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-3-flash-preview" 
+        self.client = OpenAI(api_key=api_key)
+        self.model_name = "gpt-5.5"
 
     def upload_video(self, video_path):
-        """Uploads video to Gemini File API."""
-        print(f"📤 Uploading {video_path} to Gemini...")
-        
-        # Ensure we are passing a path that exists
+        """No-op for OpenAI — we use transcript-based analysis instead of video upload."""
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
-            
-        # Using 'file' keyword instead of 'path'
-        try:
-            file_upload = self.client.files.upload(file=video_path)
-        except Exception as e:
-            print(f"❌ Gemini Upload Error: {e}")
-            raise e
-        
-        # Wait for processing
-        print("⏳ Waiting for video processing by Gemini...")
-        while True:
-            file_info = self.client.files.get(name=file_upload.name)
-            if file_info.state == "ACTIVE":
-                print("✅ Video processed and ready.")
-                return file_upload
-            elif file_info.state == "FAILED":
-                raise Exception("Video processing failed by Gemini.")
-            time.sleep(2)
+        print(f"📋 Video path registered: {video_path} (transcript-based analysis)")
+        return video_path
 
     def get_ffmpeg_filter(self, video_file_obj, duration, fps=30, width=None, height=None, transcript=None):
         """Asks Gemini for a raw FFmpeg filter string."""
@@ -111,20 +91,20 @@ class VideoEditor:
         }}
         """
 
-        print("🤖 Asking Gemini for FFmpeg filter...")
-        response = self.client.models.generate_content(
+        print("🤖 Asking OpenAI GPT-5.5 for FFmpeg filter...")
+        response = self.client.chat.completions.create(
             model=self.model_name,
-            contents=[video_file_obj, prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
+            messages=[
+                {"role": "system", "content": "You are an expert FFmpeg video editor. Return ONLY valid JSON with a single key 'filter_string'."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
         )
         
-        print(f"🔍 DEBUG: Gemini Raw Response:\n{response.text}")
+        text = response.choices[0].message.content
+        print(f"🔍 DEBUG: OpenAI Raw Response:\n{text}")
 
         try:
-            # Clean response text (remove potential markdown blocks)
-            text = response.text
             if text.startswith("```json"):
                 text = text[7:]
             elif text.startswith("```"):
@@ -135,8 +115,6 @@ class VideoEditor:
                 
             text = text.strip()
             
-            # Additional cleanup for potential trailing characters outside JSON
-            # Find the first '{' and last '}'
             start_idx = text.find('{')
             end_idx = text.rfind('}')
             
@@ -147,11 +125,11 @@ class VideoEditor:
                 
             return json.loads(text)
         except json.JSONDecodeError:
-            print(f"❌ Failed to parse JSON: {response.text}")
+            print(f"❌ Failed to parse JSON: {text}")
             return None
 
     def get_effects_config(self, video_file_obj, duration, fps=30, width=None, height=None, transcript=None):
-        """Asks Gemini for a structured EffectsConfig JSON for Remotion rendering."""
+        """Asks OpenAI GPT-5.5 for a structured EffectsConfig JSON for Remotion rendering."""
         if width is None or height is None:
             width, height = 1080, 1920
 
@@ -207,20 +185,20 @@ class VideoEditor:
         }}
         """
 
-        print("🤖 Asking Gemini for Remotion effects config...")
-        response = self.client.models.generate_content(
+        print("🤖 Asking OpenAI GPT-5.5 for Remotion effects config...")
+        response = self.client.chat.completions.create(
             model=self.model_name,
-            contents=[video_file_obj, prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
+            messages=[
+                {"role": "system", "content": "You are an expert video editor. Return ONLY valid JSON with a 'segments' array."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
         )
 
-        print(f"🔍 DEBUG: Gemini Raw Response:\n{response.text}")
+        text = response.choices[0].message.content
+        print(f"🔍 DEBUG: OpenAI Raw Response:\n{text}")
 
         try:
-            # Clean response text (remove potential markdown blocks)
-            text = response.text
             if text.startswith("```json"):
                 text = text[7:]
             elif text.startswith("```"):
@@ -231,7 +209,6 @@ class VideoEditor:
 
             text = text.strip()
 
-            # Find the first '{' and last '}'
             start_idx = text.find('{')
             end_idx = text.rfind('}')
 
@@ -242,7 +219,7 @@ class VideoEditor:
 
             return json.loads(text)
         except json.JSONDecodeError:
-            print(f"❌ Failed to parse effects config JSON: {response.text}")
+            print(f"❌ Failed to parse effects config JSON: {text}")
             return None
 
     @staticmethod
@@ -340,8 +317,11 @@ class VideoEditor:
             'ffmpeg', '-y',
             '-i', input_path,
             '-vf', filter_string,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
-            '-c:a', 'copy',
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+            '-profile:v', 'high', '-level', '4.0',
+            '-preset', 'medium', '-crf', '18',
+            '-c:a', 'aac', '-b:a', '192k',
+            '-movflags', '+faststart',
             output_path
         ]
         

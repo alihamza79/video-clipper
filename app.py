@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, Response
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 
@@ -177,16 +177,81 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files for serving videos
-app.mount("/videos", StaticFiles(directory=OUTPUT_DIR), name="videos")
-
 # Mount static files for serving thumbnails
 THUMBNAILS_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
 os.makedirs(THUMBNAILS_DIR, exist_ok=True)
 app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails")
 
+
+@app.api_route("/videos/{path:path}", methods=["GET", "HEAD"])
+async def serve_video(path: str, request: Request):
+    """Serve video files with proper range request and HEAD support for browser playback."""
+    file_path = os.path.join(OUTPUT_DIR, path)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    file_size = os.path.getsize(file_path)
+    content_type = "video/mp4"
+    if file_path.endswith(".webm"):
+        content_type = "video/webm"
+
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(file_size),
+        "Content-Type": content_type,
+    }
+
+    if request.method == "HEAD":
+        return Response(content=b"", headers=base_headers)
+
+    range_header = request.headers.get("range")
+    if range_header:
+        range_match = range_header.strip().split("=")[-1]
+        range_parts = range_match.split("-")
+        start = int(range_parts[0])
+        end = int(range_parts[1]) if range_parts[1] else min(start + 5 * 1024 * 1024, file_size - 1)
+        end = min(end, file_size - 1)
+        content_length = end - start + 1
+
+        def iter_file():
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                remaining = content_length
+                while remaining > 0:
+                    chunk_size = min(65536, remaining)
+                    data = f.read(chunk_size)
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+
+        return StreamingResponse(
+            iter_file(),
+            status_code=206,
+            media_type=content_type,
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(content_length),
+            },
+        )
+
+    return StreamingResponse(
+        open(file_path, "rb"),
+        media_type=content_type,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size),
+        },
+    )
+
 class ProcessRequest(BaseModel):
     url: str
+
+_SUPPRESSED_PREFIXES = (
+    'objc[', 'WARNING: All log messages before absl',
+    'I0000 ', 'W0000 ', 'INFO: Created TensorFlow',
+)
 
 def enqueue_output(out, job_id):
     """Reads output from a subprocess and appends it to jobs logs."""
@@ -194,6 +259,8 @@ def enqueue_output(out, job_id):
         for line in iter(out.readline, b''):
             decoded_line = line.decode('utf-8').strip()
             if decoded_line:
+                if any(decoded_line.startswith(p) for p in _SUPPRESSED_PREFIXES):
+                    continue
                 print(f"📝 [Job Output] {decoded_line}")
                 if job_id in jobs:
                     jobs[job_id]['logs'].append(decoded_line)
@@ -312,18 +379,24 @@ async def run_job(job_id, job_data):
 async def process_endpoint(
     request: Request,
     file: Optional[UploadFile] = File(None),
-    url: Optional[str] = Form(None)
+    url: Optional[str] = Form(None),
+    num_clips: Optional[int] = Form(None),
+    min_duration: Optional[int] = Form(None),
+    max_duration: Optional[int] = Form(None),
 ):
-    api_key = request.headers.get("X-Gemini-Key")
+    api_key = request.headers.get("X-OpenAI-Key") or os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
-    
+        raise HTTPException(status_code=400, detail="OPENAI_API_KEY not configured on server")
+
     # Handle JSON body manually for URL payload
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         body = await request.json()
         url = body.get("url")
-    
+        num_clips = body.get("num_clips", num_clips)
+        min_duration = body.get("min_duration", min_duration)
+        max_duration = body.get("max_duration", max_duration)
+
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
 
@@ -334,7 +407,7 @@ async def process_endpoint(
     # Prepare Command
     cmd = ["python", "-u", "main.py"] # -u for unbuffered
     env = os.environ.copy()
-    env["GEMINI_API_KEY"] = api_key # Override with key from request
+    env["OPENAI_API_KEY"] = api_key
     
     if url:
         cmd.extend(["-u", url])
@@ -358,6 +431,13 @@ async def process_endpoint(
         cmd.extend(["-i", input_path])
 
     cmd.extend(["-o", job_output_dir])
+
+    if num_clips:
+        cmd.extend(["--num-clips", str(int(num_clips))])
+    if min_duration:
+        cmd.extend(["--min-duration", str(int(min_duration))])
+    if max_duration:
+        cmd.extend(["--max-duration", str(int(max_duration))])
 
     # Enqueue Job
     jobs[job_id] = {
@@ -399,13 +479,12 @@ class EditRequest(BaseModel):
 @app.post("/api/edit")
 async def edit_clip(
     req: EditRequest,
-    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")
+    x_openai_key: Optional[str] = Header(None, alias="X-OpenAI-Key")
 ):
-    # Determine API Key
-    final_api_key = req.api_key or x_gemini_key or os.environ.get("GEMINI_API_KEY")
+    final_api_key = req.api_key or x_openai_key or os.environ.get("OPENAI_API_KEY")
     
     if not final_api_key:
-        raise HTTPException(status_code=400, detail="Missing Gemini API Key (Header or Body)")
+        raise HTTPException(status_code=400, detail="Missing OpenAI API Key (Header or Body)")
 
     if req.job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -536,10 +615,10 @@ class SubtitleRequest(BaseModel):
 @app.get("/api/clip/{job_id}/{clip_index}/transcript")
 async def get_clip_transcript(job_id: str, clip_index: int):
     """Return word-level captions for a specific clip, formatted for Remotion."""
-    if job_id not in jobs:
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(output_dir):
         raise HTTPException(status_code=404, detail="Job not found")
 
-    output_dir = os.path.join(OUTPUT_DIR, job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
 
     if not json_files:
@@ -615,13 +694,13 @@ class EffectsGenerateRequest(BaseModel):
 @app.post("/api/effects/generate")
 async def generate_effects_config(
     req: EffectsGenerateRequest,
-    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")
+    x_openai_key: Optional[str] = Header(None, alias="X-OpenAI-Key")
 ):
-    """Generate structured EffectsConfig JSON for Remotion rendering via Gemini AI."""
-    final_api_key = x_gemini_key or os.environ.get("GEMINI_API_KEY")
+    """Generate structured EffectsConfig JSON for Remotion rendering via OpenAI."""
+    final_api_key = x_openai_key or os.environ.get("OPENAI_API_KEY")
 
     if not final_api_key:
-        raise HTTPException(status_code=400, detail="Missing Gemini API Key (Header)")
+        raise HTTPException(status_code=400, detail="Missing OpenAI API Key (Header)")
 
     if req.job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -652,7 +731,7 @@ async def generate_effects_config(
             shutil.copy(input_path, safe_input_path)
 
             try:
-                # Upload video to Gemini
+                # Register video for analysis
                 vid_file = editor.upload_video(safe_input_path)
 
                 # Get video metadata via ffprobe
@@ -706,7 +785,7 @@ async def generate_effects_config(
         effects_config = await loop.run_in_executor(None, run_effects_generation)
 
         if effects_config is None:
-            raise HTTPException(status_code=500, detail="Failed to generate effects config from Gemini")
+            raise HTTPException(status_code=500, detail="Failed to generate effects config from OpenAI")
 
         return {"effects": effects_config}
 
@@ -1241,12 +1320,12 @@ async def thumbnail_analyze(
     file: Optional[UploadFile] = File(None),
     url: Optional[str] = Form(None),
     session_id: Optional[str] = Form(None),
-    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")
+    x_openai_key: Optional[str] = Header(None, alias="X-OpenAI-Key")
 ):
     """Analyze a video and suggest viral YouTube titles."""
-    api_key = x_gemini_key
+    api_key = x_openai_key
     if not api_key:
-        raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+        raise HTTPException(status_code=400, detail="Missing X-OpenAI-Key header")
 
     pre_transcript = None
 
@@ -1325,12 +1404,12 @@ class ThumbnailTitlesRequest(BaseModel):
 @app.post("/api/thumbnail/titles")
 async def thumbnail_titles(
     req: ThumbnailTitlesRequest,
-    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")
+    x_openai_key: Optional[str] = Header(None, alias="X-OpenAI-Key")
 ):
     """Refine title suggestions or accept a manual title."""
-    api_key = x_gemini_key
+    api_key = x_openai_key
     if not api_key:
-        raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+        raise HTTPException(status_code=400, detail="Missing X-OpenAI-Key header")
 
     # Manual title mode - just create a session with the user's title
     if req.title:
@@ -1387,12 +1466,12 @@ async def thumbnail_generate(
     count: int = Form(3),
     face: Optional[UploadFile] = File(None),
     background: Optional[UploadFile] = File(None),
-    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")
+    x_openai_key: Optional[str] = Header(None, alias="X-OpenAI-Key")
 ):
-    """Generate YouTube thumbnails with Gemini image generation."""
-    api_key = x_gemini_key
+    """Generate YouTube thumbnails with OpenAI image generation."""
+    api_key = x_openai_key
     if not api_key:
-        raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+        raise HTTPException(status_code=400, detail="Missing X-OpenAI-Key header")
 
     # Clamp count
     count = min(max(1, count), 6)
@@ -1435,7 +1514,7 @@ async def thumbnail_generate(
         )
 
         if not thumbnails:
-            raise HTTPException(status_code=500, detail="Thumbnail generation failed. Please check your Gemini API key has access to image generation (gemini-3.1-flash-image-preview model).")
+            raise HTTPException(status_code=500, detail="Thumbnail generation failed. Please check your OpenAI API key.")
 
         return {"thumbnails": thumbnails}
 
@@ -1453,12 +1532,12 @@ class ThumbnailDescribeRequest(BaseModel):
 @app.post("/api/thumbnail/describe")
 async def thumbnail_describe(
     req: ThumbnailDescribeRequest,
-    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")
+    x_openai_key: Optional[str] = Header(None, alias="X-OpenAI-Key")
 ):
     """Generate a YouTube description with chapters from the transcript."""
-    api_key = x_gemini_key
+    api_key = x_openai_key
     if not api_key:
-        raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+        raise HTTPException(status_code=400, detail="Missing X-OpenAI-Key header")
 
     if req.session_id not in thumbnail_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -1638,12 +1717,12 @@ class SaaSAnalyzeRequest(BaseModel):
 @app.post("/api/saasshorts/analyze")
 async def saasshorts_analyze(
     req: SaaSAnalyzeRequest,
-    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+    x_openai_key: Optional[str] = Header(None, alias="X-OpenAI-Key"),
 ):
     """Analyze a URL or manual description and generate video scripts."""
-    gemini_key = x_gemini_key or os.environ.get("GEMINI_API_KEY")
-    if not gemini_key:
-        raise HTTPException(status_code=400, detail="Missing Gemini API Key")
+    openai_key = x_openai_key or os.environ.get("OPENAI_API_KEY")
+    if not openai_key:
+        raise HTTPException(status_code=400, detail="Missing OpenAI API Key")
 
     if not req.url and not req.description:
         raise HTTPException(status_code=400, detail="Provide a URL or a product description")
@@ -1657,8 +1736,8 @@ async def saasshorts_analyze(
             if req.url and req.url.strip():
                 # URL provided: full scrape + research pipeline
                 scraped = scrape_website(req.url)
-                web_research = research_saas_online(req.url, gemini_key)
-                analysis = analyze_saas(scraped, gemini_key, web_research=web_research)
+                web_research = research_saas_online(req.url, openai_key)
+                analysis = analyze_saas(scraped, openai_key, web_research=web_research)
             else:
                 # Manual description: build analysis from description
                 analysis = {
@@ -1671,7 +1750,7 @@ async def saasshorts_analyze(
                     "tone": "casual and authentic",
                 }
 
-            scripts = generate_scripts(analysis, gemini_key, req.num_scripts, req.style, req.language, req.actor_gender)
+            scripts = generate_scripts(analysis, openai_key, req.num_scripts, req.style, req.language, req.actor_gender)
             return {
                 "analysis": analysis,
                 "scripts": scripts,
