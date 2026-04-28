@@ -6,7 +6,7 @@ import ProcessingAnimation from './components/ProcessingAnimation';
 import { getApiUrl } from './config';
 
 
-// Simple TikTok icon sine Lucide might not have it or it varies
+// Simple TikTok icon since Lucide might not have it or it varies.
 const TikTokIcon = ({ size = 16, className = "" }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className}>
     <path d="M19.589 6.686a4.793 4.793 0 0 1-3.77-4.245V2h-3.445v13.672a2.896 2.896 0 0 1-5.201 1.743l-.002-.001.002.001a2.895 2.895 0 0 1 3.183-4.51v-3.5a6.329 6.329 0 0 0-5.394 10.692 6.33 6.33 0 0 0 10.857-4.424V8.687a8.182 8.182 0 0 0 4.773 1.526V6.79a4.831 4.831 0 0 1-1.003-.104z" />
@@ -16,7 +16,7 @@ const TikTokIcon = ({ size = 16, className = "" }) => (
 const SESSION_KEY = 'vedioclipper_session';
 const SESSION_MAX_AGE = 3600000; // 1 hour (matches server job retention)
 
-// Mock polling function
+// Poll the FastAPI job queue for progress and results.
 const pollJob = async (jobId) => {
   const res = await fetch(getApiUrl(`/api/status/${jobId}`));
   if (!res.ok) throw new Error('Status check failed');
@@ -33,8 +33,6 @@ function App() {
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
 
   const [sessionRecovered, setSessionRecovered] = useState(false);
-  const [showScheduleWeek, setShowScheduleWeek] = useState(false);
-
   // Sync state for original video playback
   const [syncedTime, setSyncedTime] = useState(0);
   const [isSyncedPlaying, setIsSyncedPlaying] = useState(false);
@@ -94,7 +92,7 @@ function App() {
     } catch (e) {
       // localStorage full or serialization error - ignore
     }
-  }, [jobId, status, results, activeTab]);
+  }, [jobId, status, results, processingMedia, activeTab]);
 
   useEffect(() => {
     let interval;
@@ -204,45 +202,6 @@ function App() {
           <span className="font-medium hidden lg:block">Clip Generator</span>
         </button>
 
-        {/* AI Shorts tab - disabled for now
-        <button
-          onClick={() => setActiveTab('saasshorts')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'saasshorts' ? 'bg-violet-500/10 text-violet-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <Sparkles size={20} />
-          <span className="font-medium hidden lg:block">AI Shorts</span>
-        </button>
-        */}
-
-        {/* UGC Gallery tab - disabled for now
-        <button
-          onClick={() => setActiveTab('ugc-gallery')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'ugc-gallery' ? 'bg-violet-500/10 text-violet-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <LayoutGrid size={20} />
-          <span className="font-medium hidden lg:block">UGC Gallery</span>
-        </button>
-        */}
-
-        {/* YouTube Studio tab - disabled for now
-        <button
-          onClick={() => setActiveTab('thumbnails')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'thumbnails' ? 'bg-primary/10 text-primary' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <Image size={20} />
-          <span className="font-medium hidden lg:block">YouTube Studio</span>
-        </button>
-        */}
-
-        {/* Settings tab - disabled, using server-side env keys
-        <button
-          onClick={() => setActiveTab('settings')}
-          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'settings' ? 'bg-primary/10 text-primary' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-        >
-          <Settings size={20} />
-          <span className="font-medium hidden lg:block">Settings</span>
-        </button>
-        */}
       </nav>
 
       <div className="p-4 border-t border-white/5">
@@ -297,13 +256,6 @@ function App() {
 
         {/* Main Workspace */}
         <div className="flex-1 overflow-hidden relative">
-
-          {/* Settings / SaaS Shorts / UGC Gallery / Thumbnails views — disabled for now */}
-
-          {/* View: Gallery */}
-          {/* {activeTab === 'gallery' && (
-            <Gallery />
-          )} */}
 
           {/* View: Dashboard (Idle) */}
           {activeTab === 'dashboard' && status === 'idle' && (
@@ -400,7 +352,6 @@ function App() {
                       ${results.cost_analysis.total_cost.toFixed(5)}
                     </span>
                   )}
-                  {/* Schedule button - disabled for now */}
                 </h2>
 
                 <div className="flex-1 overflow-y-auto custom-scrollbar p-1">
@@ -443,14 +394,6 @@ function App() {
         </div>
       </main>
 
-      {/* Schedule Week Modal - disabled for now
-      <ScheduleWeekModal
-        isOpen={showScheduleWeek}
-        onClose={() => setShowScheduleWeek(false)}
-        clips={results?.clips || []}
-        jobId={jobId}
-      />
-      */}
     </div>
   );
 }

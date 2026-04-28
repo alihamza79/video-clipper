@@ -70,8 +70,6 @@ export default function SaaShortsTab({ openaiApiKey, elevenLabsKey, falKey, uplo
   const [actorGallery, setActorGallery] = useState([]);
   const [loadingGallery, setLoadingGallery] = useState(false);
   const [uploadedActorPreview, setUploadedActorPreview] = useState(null); // {localPreview, serverUrl}
-  const [productPhoto, setProductPhoto] = useState(null); // {preview, serverUrl}
-  const [productDescription, setProductDescription] = useState('');
 
   // Step 3: Generate
   const [generating, setGenerating] = useState(false);
@@ -97,7 +95,7 @@ export default function SaaShortsTab({ openaiApiKey, elevenLabsKey, falKey, uplo
       setActorDescription(scripts[0].actor_description || '');
       setEditedNarration(scripts[0].full_narration || '');
     }
-  }, []);
+  }, [actorDescription, fromCache, scripts]);
 
   // Fetch actor gallery on mount
   useEffect(() => {
@@ -111,9 +109,23 @@ export default function SaaShortsTab({ openaiApiKey, elevenLabsKey, falKey, uplo
 
   // Fetch voices on mount
   useEffect(() => {
-    if (elevenLabsKey) {
-      fetchVoices();
-    }
+    if (!elevenLabsKey) return;
+
+    const fetchVoices = async () => {
+      try {
+        const res = await fetch(getApiUrl('/api/saasshorts/voices'), {
+          headers: { 'X-ElevenLabs-Key': elevenLabsKey },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setVoices(data.voices || []);
+        }
+      } catch (e) {
+        console.error('Voices fetch error:', e);
+      }
+    };
+
+    fetchVoices();
   }, [elevenLabsKey]);
 
   // Reset selected voice when actor gender changes
@@ -131,7 +143,7 @@ export default function SaaShortsTab({ openaiApiKey, elevenLabsKey, falKey, uplo
     } else {
       setSelectedVoice(genderDefaults[`${language}-${actorGender}`] || genderDefaults['en-female']);
     }
-  }, [actorGender, language]);
+  }, [actorGender, language, voices]);
 
   // Poll generation status
   useEffect(() => {
@@ -169,20 +181,6 @@ export default function SaaShortsTab({ openaiApiKey, elevenLabsKey, falKey, uplo
     }
     return () => clearInterval(interval);
   }, [jobId, genStatus]);
-
-  const fetchVoices = async () => {
-    try {
-      const res = await fetch(getApiUrl('/api/saasshorts/voices'), {
-        headers: { 'X-ElevenLabs-Key': elevenLabsKey },
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setVoices(data.voices || []);
-      }
-    } catch (e) {
-      console.error('Voices fetch error:', e);
-    }
-  };
 
   const handleAnalyze = async () => {
     if (!url.trim() && !description.trim()) return;

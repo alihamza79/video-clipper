@@ -1,5 +1,11 @@
 import os
 os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
+LOCAL_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(LOCAL_CACHE_DIR, "matplotlib"))
+os.environ.setdefault("YOLO_CONFIG_DIR", os.path.join(LOCAL_CACHE_DIR, "ultralytics"))
+os.environ.setdefault("XDG_CACHE_HOME", LOCAL_CACHE_DIR)
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+os.makedirs(os.environ["YOLO_CONFIG_DIR"], exist_ok=True)
 
 import time
 import cv2
@@ -77,9 +83,29 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Return exactly {nu
 model = YOLO('yolov8n.pt')
 
 # --- MediaPipe Setup ---
-# Use standard Face Detection (BlazeFace) for speed
+# Lazily initialize Face Detection so macOS/headless OpenGL failures do not
+# prevent the full processing pipeline from falling back to YOLO tracking.
 mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+face_detection = None
+face_detection_unavailable = False
+
+def get_face_detection():
+    global face_detection, face_detection_unavailable
+    if face_detection or face_detection_unavailable:
+        return face_detection
+
+    for model_selection in (0, 1):
+        try:
+            face_detection = mp_face_detection.FaceDetection(
+                model_selection=model_selection,
+                min_detection_confidence=0.5,
+            )
+            return face_detection
+        except RuntimeError as exc:
+            print(f"⚠️ MediaPipe FaceDetection unavailable with model_selection={model_selection}: {exc}")
+
+    face_detection_unavailable = True
+    return None
 
 class SmoothedCameraman:
     """
@@ -286,9 +312,17 @@ def detect_face_candidates(frame):
     """
     Returns list of all detected faces using lightweight FaceDetection.
     """
+    detector = get_face_detection()
+    if detector is None:
+        return []
+
     height, width, _ = frame.shape
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_detection.process(rgb_frame)
+    try:
+        results = detector.process(rgb_frame)
+    except RuntimeError as exc:
+        print(f"⚠️ MediaPipe face detection failed during processing; using YOLO fallback: {exc}")
+        return []
     
     candidates = []
     
@@ -482,6 +516,10 @@ def download_youtube_video(url, output_dir="."):
     else:
         cookies_path = None
         print("⚠️ YOUTUBE_COOKIES env var not found.")
+
+    youtube_proxy = os.environ.get("YOUTUBE_PROXY", "")
+    if not youtube_proxy:
+        print("ℹ️ YouTube proxy disabled. Set YOUTUBE_PROXY to use one explicitly.")
     
     # Common yt-dlp options to work around YouTube bot detection.
     # extractor_args tries multiple player clients in order; tv_embed / android
@@ -496,6 +534,7 @@ def download_youtube_video(url, output_dir="."):
         'fragment_retries': 10,
         'nocheckcertificate': True,
         'cachedir': False,
+        'proxy': youtube_proxy,
         'extractor_args': {
             'youtube': {
                 'player_client': ['tv_embed', 'android', 'mweb', 'web'],

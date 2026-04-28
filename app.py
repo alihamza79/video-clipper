@@ -414,6 +414,13 @@ async def process_endpoint(
     cmd = [sys.executable, "-u", "main.py"] # -u for unbuffered
     env = os.environ.copy()
     env["OPENAI_API_KEY"] = api_key
+    cache_dir = os.path.join(job_output_dir, ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    env.setdefault("MPLCONFIGDIR", os.path.join(cache_dir, "matplotlib"))
+    env.setdefault("YOLO_CONFIG_DIR", os.path.join(cache_dir, "ultralytics"))
+    env.setdefault("XDG_CACHE_HOME", cache_dir)
+    os.makedirs(env["MPLCONFIGDIR"], exist_ok=True)
+    os.makedirs(env["YOLO_CONFIG_DIR"], exist_ok=True)
     
     if url:
         cmd.extend(["-u", url])
