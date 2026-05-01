@@ -4,6 +4,10 @@ import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
 import { getApiUrl } from './config';
+import GoogleSignInButton from './components/GoogleSignInButton';
+import { clearAuthToken, getAuthToken, setAuthToken } from './auth';
+import EmailAuthForm from './components/EmailAuthForm';
+import ResetPasswordForm from './components/ResetPasswordForm';
 
 
 // Simple TikTok icon since Lucide might not have it or it varies.
@@ -24,6 +28,10 @@ const pollJob = async (jobId) => {
 };
 
 function App() {
+  const [resetToken, setResetToken] = useState('');
+  const [authReady, setAuthReady] = useState(false);
+  const [user, setUser] = useState(null);
+  const [authError, setAuthError] = useState('');
   const [jobId, setJobId] = useState(null);
   const [status, setStatus] = useState('idle'); // idle, processing, complete, error
   const [results, setResults] = useState(null);
@@ -47,6 +55,38 @@ function App() {
   const handleClipPause = () => {
     setIsSyncedPlaying(false);
   };
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get('token');
+    if (token) {
+      setResetToken(token);
+    }
+  }, []);
+
+  useEffect(() => {
+    const bootstrapAuth = async () => {
+      const token = getAuthToken();
+      if (!token) {
+        setAuthReady(true);
+        return;
+      }
+      try {
+        const res = await fetch(getApiUrl('/api/auth/me'), {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) throw new Error('Session expired');
+        const me = await res.json();
+        setUser(me);
+      } catch {
+        clearAuthToken();
+        setUser(null);
+      } finally {
+        setAuthReady(true);
+      }
+    };
+    bootstrapAuth();
+  }, []);
 
   // Session Recovery: Restore on mount
   useEffect(() => {
@@ -182,6 +222,25 @@ function App() {
     localStorage.removeItem(SESSION_KEY);
   };
 
+  const handleAuthSuccess = (data) => {
+    setAuthError('');
+    setAuthToken(data.access_token);
+    setUser(data.user || null);
+  };
+
+  const handleLogout = () => {
+    clearAuthToken();
+    setUser(null);
+    handleReset();
+  };
+
+  const handleResetPasswordDone = () => {
+    setResetToken('');
+    const url = new URL(window.location.href);
+    url.searchParams.delete('token');
+    window.history.replaceState({}, '', url.toString());
+  };
+
   // --- UI Components ---
 
   const Sidebar = () => (
@@ -237,7 +296,19 @@ function App() {
             )}
           </div>
 
-          <div className="flex items-center gap-4" />
+          <div className="flex items-center gap-4">
+            {user ? (
+              <>
+                <span className="hidden sm:inline text-sm text-zinc-300">{user.email}</span>
+                <button
+                  onClick={handleLogout}
+                  className="text-xs px-3 py-1.5 rounded-lg border border-white/10 text-zinc-300 hover:text-white hover:border-white/20 transition-colors"
+                >
+                  Logout
+                </button>
+              </>
+            ) : null}
+          </div>
         </header>
 
         {/* Session Recovery Banner */}
@@ -257,8 +328,41 @@ function App() {
         {/* Main Workspace */}
         <div className="flex-1 overflow-hidden relative">
 
+          {!authReady && (
+            <div className="h-full flex items-center justify-center text-zinc-400">Loading session...</div>
+          )}
+
+          {authReady && !user && (
+            <div className="h-full flex items-center justify-center p-6">
+              <div className="max-w-md w-full rounded-2xl border border-white/10 bg-black/20 p-8 text-center space-y-5">
+                {resetToken ? (
+                  <>
+                    <h2 className="text-2xl font-bold text-white">Reset your password</h2>
+                    <p className="text-zinc-400 text-sm">Set a new password for your account.</p>
+                    <ResetPasswordForm token={resetToken} onSuccess={handleResetPasswordDone} onError={setAuthError} />
+                  </>
+                ) : (
+                  <>
+                    <h2 className="text-2xl font-bold text-white">Sign in required</h2>
+                    <p className="text-zinc-400 text-sm">Continue with Google or use email/password.</p>
+                    <div className="flex justify-center">
+                      <GoogleSignInButton onLoginSuccess={handleAuthSuccess} onError={setAuthError} />
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <div className="h-px bg-white/10 flex-1" />
+                      <span className="text-xs text-zinc-500">OR</span>
+                      <div className="h-px bg-white/10 flex-1" />
+                    </div>
+                    <EmailAuthForm onAuthSuccess={handleAuthSuccess} onError={setAuthError} />
+                  </>
+                )}
+                {authError ? <p className="text-red-400 text-sm">{authError}</p> : null}
+              </div>
+            </div>
+          )}
+
           {/* View: Dashboard (Idle) */}
-          {activeTab === 'dashboard' && status === 'idle' && (
+          {authReady && user && activeTab === 'dashboard' && status === 'idle' && (
             <div className="h-full flex flex-col items-center justify-center p-6 animate-[fadeIn_0.3s_ease-out]">
               <div className="max-w-xl w-full text-center space-y-8">
                 <div className="space-y-4">
@@ -282,7 +386,7 @@ function App() {
           )}
 
           {/* View: Processing / Results (Split View) */}
-          {activeTab === 'dashboard' && (status === 'processing' || status === 'complete' || status === 'error') && (
+          {authReady && user && activeTab === 'dashboard' && (status === 'processing' || status === 'complete' || status === 'error') && (
             <div className="h-full flex flex-col md:flex-row animate-[fadeIn_0.3s_ease-out]">
 
               {/* Left Panel: Preview & Status */}

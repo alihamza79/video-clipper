@@ -8,14 +8,25 @@ import glob
 import time
 import asyncio
 import sys
+import hashlib
+import base64
+import hmac
+import re
+import secrets
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from typing import Dict, Optional, List
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, StreamingResponse, Response
+from fastapi.responses import HTMLResponse, StreamingResponse, Response, JSONResponse
 from pydantic import BaseModel
+from jose import JWTError, jwt
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 
 load_dotenv()
@@ -31,6 +42,25 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
 MAX_FILE_SIZE_MB = 2048  # 2GB limit
 JOB_RETENTION_SECONDS = 3600  # 1 hour retention
+AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "false").lower() == "true"
+AUTH_SECRET = os.environ.get("NEXTAUTH_JWT_SECRET", os.environ.get("NEXTAUTH_SECRET", ""))
+AUTH_ALGORITHM = os.environ.get("NEXTAUTH_JWT_ALGORITHM", "HS256")
+AUTH_AUDIENCE = os.environ.get("NEXTAUTH_JWT_AUDIENCE")
+AUTH_ISSUER = os.environ.get("NEXTAUTH_JWT_ISSUER")
+APP_AUTH_ISSUER = os.environ.get("APP_AUTH_ISSUER", "video-clipper-api")
+APP_AUTH_TTL_HOURS = int(os.environ.get("APP_AUTH_TTL_HOURS", "168"))
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+AUTH_PUBLIC_PATHS = {
+    p.strip() for p in os.environ.get(
+        "AUTH_PUBLIC_PATHS",
+        "/,/health,/docs,/openapi.json,/api/process,/api/status,/api/translate/languages,/api/auth/google,/api/auth/signup,/api/auth/login,/api/auth/forgot-password,/api/auth/reset-password"
+    ).split(",") if p.strip()
+}
+AUTH_DATABASE_URL = os.environ.get("AUTH_DATABASE_URL", os.environ.get("DATABASE_URL", ""))
+PASSWORD_RESET_TOKEN_TTL_MINUTES = int(os.environ.get("PASSWORD_RESET_TOKEN_TTL_MINUTES", "15"))
+PASSWORD_RESET_BASE_URL = os.environ.get("PASSWORD_RESET_BASE_URL", "http://localhost:5173")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 
 # Application State
 job_queue = asyncio.Queue()
@@ -178,6 +208,173 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _is_public_path(path: str) -> bool:
+    if path in AUTH_PUBLIC_PATHS:
+        return True
+    return any(path.startswith(f"{public_path}/") for public_path in AUTH_PUBLIC_PATHS)
+
+def _verify_access_token(token: str) -> dict:
+    if not AUTH_SECRET:
+        raise ValueError("Server auth secret is not configured")
+    decode_kwargs = {"algorithms": [AUTH_ALGORITHM]}
+    if AUTH_AUDIENCE:
+        decode_kwargs["audience"] = AUTH_AUDIENCE
+    if AUTH_ISSUER:
+        decode_kwargs["issuer"] = AUTH_ISSUER
+    try:
+        return jwt.decode(token, AUTH_SECRET, **decode_kwargs)
+    except JWTError as exc:
+        raise ValueError("Invalid or expired token") from exc
+
+def _create_access_token(subject: str, email: str, name: Optional[str], picture: Optional[str]) -> str:
+    if not AUTH_SECRET:
+        raise ValueError("Server auth secret is not configured")
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": subject,
+        "email": email,
+        "name": name,
+        "picture": picture,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(hours=APP_AUTH_TTL_HOURS)).timestamp()),
+        "iss": APP_AUTH_ISSUER,
+    }
+    return jwt.encode(payload, AUTH_SECRET, algorithm=AUTH_ALGORITHM)
+
+def _get_auth_db_connection():
+    if not AUTH_DATABASE_URL:
+        raise ValueError("AUTH_DATABASE_URL (or DATABASE_URL) is not configured")
+    return psycopg2.connect(AUTH_DATABASE_URL)
+
+def _init_auth_db() -> None:
+    conn = _get_auth_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT,
+                provider TEXT NOT NULL DEFAULT 'email',
+                google_sub TEXT UNIQUE,
+                name TEXT,
+                picture TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+            # Backward-compatible schema upgrades for existing databases.
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'email'")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS picture TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub_uq ON users (google_sub)")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    used_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_id ON password_reset_tokens (user_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens (expires_at)")
+        conn.commit()
+    finally:
+        conn.close()
+
+def _ensure_neon_ready():
+    try:
+        _init_auth_db()
+    except Exception as exc:
+        print(f"⚠️ Auth DB init error: {exc}")
+
+def _normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+def _is_valid_email(email: str) -> bool:
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email))
+
+def _hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    hashed = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 150000)
+    return f"{base64.b64encode(salt).decode()}:{base64.b64encode(hashed).decode()}"
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    try:
+        salt_b64, hash_b64 = password_hash.split(":", 1)
+        salt = base64.b64decode(salt_b64.encode())
+        expected_hash = base64.b64decode(hash_b64.encode())
+        actual_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 150000)
+        return hmac.compare_digest(actual_hash, expected_hash)
+    except Exception:
+        return False
+
+def _hash_reset_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def _send_password_reset_email(email: str, reset_link: str) -> None:
+    if not RESEND_API_KEY:
+        print(f"🔐 Password reset link for {email}: {reset_link}")
+        return
+
+    text_content = (
+        "We received a request to reset your password.\n\n"
+        f"Reset it here: {reset_link}\n\n"
+        f"This link expires in {PASSWORD_RESET_TOKEN_TTL_MINUTES} minutes.\n"
+        "If you did not request this, you can ignore this email."
+    )
+    html_content = (
+        "<p>We received a request to reset your password.</p>"
+        f"<p><a href=\"{reset_link}\">Reset Password</a></p>"
+        f"<p>This link expires in {PASSWORD_RESET_TOKEN_TTL_MINUTES} minutes.</p>"
+        "<p>If you did not request this, you can ignore this email.</p>"
+    )
+
+    with httpx.Client(timeout=20.0) as client:
+        response = client.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": RESEND_FROM_EMAIL,
+                "to": [email],
+                "subject": "Reset your VedioClipper password",
+                "text": text_content,
+                "html": html_content,
+            },
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise ValueError(f"Resend API error: {response.status_code} {response.text}") from exc
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if AUTH_ENABLED and path.startswith("/api") and not _is_public_path(path):
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(status_code=401, content={"detail": "Missing Bearer token"})
+        token = auth_header.split(" ", 1)[1].strip()
+        try:
+            claims = _verify_access_token(token)
+        except ValueError as exc:
+            detail = str(exc)
+            status_code = 500 if "secret" in detail.lower() else 401
+            return JSONResponse(status_code=status_code, content={"detail": detail})
+        request.state.user = claims
+    return await call_next(request)
+
 # Mount static files for serving thumbnails
 THUMBNAILS_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
 os.makedirs(THUMBNAILS_DIR, exist_ok=True)
@@ -253,6 +450,277 @@ async def serve_video(path: str, request: Request):
 
 class ProcessRequest(BaseModel):
     url: str
+
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+
+class EmailSignupRequest(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = None
+
+class EmailLoginRequest(BaseModel):
+    email: str
+    password: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+@app.post("/api/auth/google")
+async def auth_google(req: GoogleAuthRequest):
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_ID is not configured")
+    try:
+        idinfo = google_id_token.verify_oauth2_token(
+            req.id_token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid Google token") from exc
+
+    if idinfo.get("iss") not in {"accounts.google.com", "https://accounts.google.com"}:
+        raise HTTPException(status_code=401, detail="Invalid token issuer")
+    if not idinfo.get("email_verified"):
+        raise HTTPException(status_code=401, detail="Google email is not verified")
+
+    email = idinfo.get("email")
+    subject = idinfo.get("sub")
+    if not email or not subject:
+        raise HTTPException(status_code=401, detail="Google token missing required claims")
+
+    name = idinfo.get("name")
+    picture = idinfo.get("picture")
+    conn = _get_auth_db_connection()
+    user_id = None
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO users (id, email, password_hash, provider, google_sub, name, picture)
+                VALUES (%s, %s, '', 'google', %s, %s, %s)
+                ON CONFLICT (email) DO UPDATE SET
+                    provider = 'google',
+                    google_sub = EXCLUDED.google_sub,
+                    name = EXCLUDED.name,
+                    picture = EXCLUDED.picture
+                RETURNING id
+                """,
+                (str(uuid.uuid4()), email, subject, name, picture),
+            )
+            row = cur.fetchone()
+            user_id = str(row["id"])
+        conn.commit()
+    finally:
+        conn.close()
+
+    access_token = _create_access_token(subject=user_id, email=email, name=name, picture=picture)
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": user_id,
+            "email": email,
+            "name": name,
+            "picture": picture,
+        },
+    }
+
+@app.post("/api/auth/signup")
+async def auth_signup(req: EmailSignupRequest):
+    email = _normalize_email(req.email)
+    password = req.password or ""
+    name = (req.name or "").strip() or None
+
+    if not _is_valid_email(email):
+        raise HTTPException(status_code=400, detail="Invalid email format")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    user_id = str(uuid.uuid4())
+    password_hash = _hash_password(password)
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    conn = _get_auth_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (id, email, password_hash, provider, name, created_at)
+                VALUES (%s, %s, %s, 'email', %s, %s)
+                """,
+                (user_id, email, password_hash, name, created_at),
+            )
+        conn.commit()
+    except psycopg2.errors.UniqueViolation as exc:
+        conn.rollback()
+        raise HTTPException(status_code=409, detail="Email already registered") from exc
+    finally:
+        conn.close()
+
+    access_token = _create_access_token(subject=user_id, email=email, name=name, picture=None)
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": user_id,
+            "email": email,
+            "name": name,
+            "picture": None,
+        },
+    }
+
+@app.post("/api/auth/login")
+async def auth_login(req: EmailLoginRequest):
+    email = _normalize_email(req.email)
+    password = req.password or ""
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required")
+
+    conn = _get_auth_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, email, password_hash, name FROM users WHERE email = %s AND provider = 'email'",
+                (email,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row or not _verify_password(password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    access_token = _create_access_token(
+        subject=row["id"],
+        email=row["email"],
+        name=row["name"],
+        picture=None,
+    )
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": row["id"],
+            "email": row["email"],
+            "name": row["name"],
+            "picture": None,
+        },
+    }
+
+@app.post("/api/auth/forgot-password")
+async def auth_forgot_password(req: ForgotPasswordRequest):
+    email = _normalize_email(req.email)
+    generic_response = {"detail": "If an account exists, a reset link has been sent."}
+    if not _is_valid_email(email):
+        return generic_response
+
+    conn = _get_auth_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, email, provider FROM users WHERE email = %s",
+                (email,),
+            )
+            user = cur.fetchone()
+            if not user or user.get("provider") != "email":
+                conn.commit()
+                return generic_response
+
+            token = secrets.token_urlsafe(48)
+            token_hash = _hash_reset_token(token)
+            expires_at = datetime.now(timezone.utc) + timedelta(minutes=PASSWORD_RESET_TOKEN_TTL_MINUTES)
+
+            cur.execute(
+                "UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = %s AND used_at IS NULL",
+                (user["id"],),
+            )
+            cur.execute(
+                """
+                INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+                VALUES (%s, %s, %s)
+                """,
+                (user["id"], token_hash, expires_at),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reset_link = f"{PASSWORD_RESET_BASE_URL.rstrip('/')}/?token={token}"
+    try:
+        _send_password_reset_email(email, reset_link)
+    except Exception as exc:
+        # Do not leak provider/email validity to client.
+        print(f"⚠️ Failed sending password reset email to {email}: {exc}")
+    return generic_response
+
+@app.post("/api/auth/reset-password")
+async def auth_reset_password(req: ResetPasswordRequest):
+    token = (req.token or "").strip()
+    new_password = req.new_password or ""
+
+    if not token:
+        raise HTTPException(status_code=400, detail="Token is required")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    token_hash = _hash_reset_token(token)
+    new_password_hash = _hash_password(new_password)
+
+    conn = _get_auth_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, user_id
+                FROM password_reset_tokens
+                WHERE token_hash = %s
+                  AND used_at IS NULL
+                  AND expires_at > NOW()
+                LIMIT 1
+                """,
+                (token_hash,),
+            )
+            reset_row = cur.fetchone()
+            if not reset_row:
+                conn.rollback()
+                raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+            cur.execute(
+                "UPDATE users SET password_hash = %s, provider = 'email' WHERE id = %s",
+                (new_password_hash, reset_row["user_id"]),
+            )
+            cur.execute(
+                "UPDATE password_reset_tokens SET used_at = NOW() WHERE id = %s",
+                (reset_row["id"],),
+            )
+            cur.execute(
+                "UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = %s AND used_at IS NULL",
+                (reset_row["user_id"],),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"detail": "Password has been reset successfully"}
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request):
+    user = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return {
+        "id": user.get("sub"),
+        "email": user.get("email"),
+        "name": user.get("name"),
+        "picture": user.get("picture"),
+    }
+
+_ensure_neon_ready()
 
 _SUPPRESSED_PREFIXES = (
     'objc[', 'WARNING: All log messages before absl',

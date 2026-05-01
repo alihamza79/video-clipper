@@ -16,3 +16,6 @@ python-multipart
 httpx
 Pillow
 beautifulsoup4
+python-jose[cryptography]
+google-auth
+psycopg2-binary
