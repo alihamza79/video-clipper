@@ -32,8 +32,8 @@ from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3
 load_dotenv()
 
 # Constants
-UPLOAD_DIR = "uploads"
-OUTPUT_DIR = "output"
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "uploads")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -200,9 +200,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # Enable CORS for frontend
+_cors_origins_env = os.environ.get("CORS_ORIGINS", "")
+_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()] if _cors_origins_env else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
